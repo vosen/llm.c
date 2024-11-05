@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include "cudnn_att.h"
 #include <cudnn_frontend.h>
+#include <cuda_runtime.h>
 
 namespace fe = cudnn_frontend;
 
@@ -90,7 +91,7 @@ auto lookup_cache_or_build_graph_fwd(int B,int H,int T,int HS, int is_inference_
                                .set_dim({1, 1, 1, 1})
                                .set_stride({1, 1, 1, 1})
                                .set_uid(Attn_scale_UID)
-                               .set_is_pass_by_value(true)
+                               //.set_is_pass_by_value(true)
                                .set_data_type(fe::DataType_t::FLOAT));
 
     auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
@@ -180,7 +181,7 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
     auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
                             .set_dim({1, 1, 1, 1})
                             .set_stride({1, 1, 1, 1})
-                            .set_is_pass_by_value(true)
+                            //.set_is_pass_by_value(true)
                             .set_uid(Attn_scale_UID)
                             .set_data_type(fe::DataType_t::FLOAT));
     auto sdpa_backward_options = fe::graph::SDPA_backward_attributes().set_name("flash_attention_backward")
@@ -219,7 +220,8 @@ auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
     return graph;
 }
 
-void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
+void attention_forward_cudnn(void* scratch,
+                             floatX* out,  // output: (B, T, NH, HS)
                              float* stats, // output for backward pass: (B, NH, T)
                              floatX* inp,  // input: (B, T, 3, NH, HS) QKV
                              int B, int T, int NH, int C, cudaStream_t stream) {
@@ -239,9 +241,11 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     float attn_scale_cpu = 1.0 / sqrtf(HS);
     void* devPtrO = out;
 
+    cudaCheck(cudaMemcpyAsync(scratch, &attn_scale_cpu, sizeof(float), cudaMemcpyKind::cudaMemcpyHostToDevice, stream));
+
     // Build variant pack
     std::unordered_map<int64_t , void*> variant_pack = {
-        {Q_UID, devPtrQ}, {K_UID, devPtrK}, {V_UID, devPtrV}, {Attn_scale_UID, &attn_scale_cpu}, {O_UID, devPtrO}};
+        {Q_UID, devPtrQ}, {K_UID, devPtrK}, {V_UID, devPtrV}, {Attn_scale_UID, scratch}, {O_UID, devPtrO}};
 
     // Add the stats tensor unless we are only doing inference (only needed for backward pass)
     if (is_inference_only == false) {
@@ -253,7 +257,8 @@ void attention_forward_cudnn(floatX* out,  // output: (B, T, NH, HS)
     cudaCheck(cudaGetLastError());
 }
 
-void attention_backward_cudnn(floatX* dqkvr,                                       // output
+void attention_backward_cudnn(void* scratch,
+                              floatX* dqkvr,                                       // output
                               floatX* dout, floatX* qkvr, floatX* o, float* stats, // inputs
                               int B, int T, int NH, int C, cudaStream_t stream) {
     NVTX_RANGE_FN();
@@ -275,11 +280,13 @@ void attention_backward_cudnn(floatX* dqkvr,                                    
     void* devPtrdK = (dqkvr + NH * HS);
     void* devPtrdV = (dqkvr + 2 * NH * HS);
 
+    cudaCheck(cudaMemcpyAsync(scratch, &attn_scale_cpu, sizeof(float), cudaMemcpyKind::cudaMemcpyHostToDevice, stream));
+
     // Build variant pack that links each tensor to its data pointer
     std::unordered_map<int64_t, void*> variant_pack = {
         {Q_UID, devPtrQ}, {K_UID, devPtrK}, {V_UID, devPtrV}, {O_UID, devPtrO}, {dO_UID, devPtrdO}, {Stats_UID, devPtrStats},
         {dQ_UID, devPtrdQ}, {dK_UID, devPtrdK}, {dV_UID, devPtrdV},
-        {Attn_scale_UID, &attn_scale_cpu}};
+        {Attn_scale_UID, scratch}};
 
     // Execute graph
     cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
